@@ -86,7 +86,7 @@ mvn com.mycompany:xray-scan-maven-plugin:1.0.0:scan \
 ## 5. Résultats et rapport
 
 - Les vulnérabilités sont listées dans les logs Maven sous la forme :
-  `CVE-ID | package | version | CVSS | severity`.
+  `CVE-ID | package | version | CVSS | severity | fixed-version`.
 - Le rapport JSON (`target/xray-scan-report.json`) contient l'intégralité des violations (y compris celles sous le seuil) :
 
 ```json
