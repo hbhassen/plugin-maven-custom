@@ -1,13 +1,11 @@
 # xray-scan-maven-plugin
 
-Plugin Maven permettant d'automatiser le scan de vulnérabilités d'un projet Java via l'API REST v2 de JFrog Xray. Il se base sur la spécification fournie et fournit un objectif `scan` rattaché par défaut à la phase `verify`.
+Plugin Maven permettant d'automatiser le scan de vulnérabilités d'un projet Java via l'API "On-Demand Binary Scan" de JFrog Xray (`api/v1/scan/graph`). Il se base sur la spécification fournie et fournit un objectif `scan` rattaché par défaut à la phase `verify`.
 
 ## 1. Fonctionnalités principales
 
-- Connexion à JFrog Xray (authentification Basic) et interrogation des violations de sécurité pour un Watch donné.
-- Résolution automatique du seuil CVSS à appliquer :
-  - `default` → seuil 7.0.
-  - Watch personnalisé → récupération du seuil numérique ou de la sévérité minimale exposée par l'API, avec fallback sur 7.0 si l'information est indisponible.
+- Connexion à JFrog Xray (authentification Basic) et déclenchement d'un scan à la demande sur le graphe de dépendances (`api/v1/scan/graph`).
+- Seuil CVSS configurable (`threshold`, défaut 7.0) appliqué localement lors de l'analyse des résultats.
 - Génération d'un rapport JSON complet dans `target/xray-scan-report.json`.
 - Affichage dans la console Maven des CVE détectées triées par score décroissant.
 - Échec du build (`MojoFailureException`) si au moins une vulnérabilité dépasse le seuil et que `failOnThreshold=true`.
@@ -19,7 +17,7 @@ Plugin Maven permettant d'automatiser le scan de vulnérabilités d'un projet Ja
 |----------------------|------------------|
 | Maven                | 3.8.x            |
 | Java                 | 17               |
-| JFrog Xray           | 3.x (API REST v2)|
+| JFrog Xray           | 3.x (API REST v1/v2)|
 
 ## 3. Installation
 
@@ -44,9 +42,9 @@ mvn clean install
         <xrayUrl>https://mon-xray/api/v2</xrayUrl>
         <username>monUser</username>
         <password>${env.XRAY_PASSWORD}</password>
-        <watch>default</watch>
         <failOnThreshold>true</failOnThreshold>
         <timeoutSeconds>300</timeoutSeconds>
+        <threshold>7.0</threshold>
       </configuration>
       <executions>
         <execution>
@@ -64,12 +62,12 @@ mvn clean install
 
 | Propriété         | Type    | Défaut  | Description |
 |-------------------|---------|---------|-------------|
-| `xrayUrl`         | String  | –       | URL de base de l'API JFrog Xray (terminée par `/api/v2`). |
+| `xrayUrl`         | String  | –       | URL de base de l'API JFrog Xray (terminée par `/api/v2`, le plugin utilise automatiquement `api/v1/scan/graph`). |
 | `username`        | String  | –       | Identifiant ou access token (le mot de passe ne sera pas loggé). |
 | `password`        | String  | –       | Mot de passe ou token API. Peut provenir d'une variable d'environnement ou du `settings.xml`. |
-| `watch`           | String  | `default` | Watch à utiliser pour filtrer les violations. |
 | `failOnThreshold` | Boolean | `true`  | Si `true`, le build échoue lorsqu'une violation dépasse le seuil. |
 | `timeoutSeconds`  | Integer | `300`   | Timeout maximal pour chaque appel HTTP. |
+| `threshold`       | Double  | `7.0`   | Seuil CVSS appliqué localement (>= déclenche l'échec si `failOnThreshold=true`). |
 | `skip`            | Boolean | `false` | Permet d'ignorer totalement le scan. |
 
 ### 4.3 Exécution via la ligne de commande
@@ -79,7 +77,7 @@ mvn com.mycompany:xray-scan-maven-plugin:1.0.0:scan \
   -DxrayUrl=https://xray.mycompany.com/api/v2 \
   -Dusername=john.doe \
   -Dpassword=${XRAY_TOKEN} \
-  -Dwatch=critical-watch \
+  -Dthreshold=8.0 \
   -DfailOnThreshold=true
 ```
 
@@ -108,7 +106,6 @@ mvn com.mycompany:xray-scan-maven-plugin:1.0.0:scan \
 | Cas                        | Comportement |
 |---------------------------|--------------|
 | 401 / 403                 | `MojoFailureException` – identifiants invalides. |
-| 404 sur un watch custom   | `MojoFailureException` précisant que le watch est introuvable. |
 | Timeout ou erreur réseau  | `MojoExecutionException`. |
 | `failOnThreshold=false`   | Le build continue, avec un warning si des vulnérabilités dépassent le seuil. |
 
@@ -150,5 +147,6 @@ Ce projet est distribué sous licence [Apache 2.0](LICENSE).
 ## 9. Références
 
 - [JFrog Xray REST API v2](https://www.jfrog.com/confluence/display/JFROG/Xray+REST+API)
+- [Xray On-Demand Binary Scan](https://jfrog.com/help/r/xray-jf-docker-scan-watches-xx-with-ignore-rule/xray-on-demand-binary-scan)
 - [Développement de plugins Maven](https://maven.apache.org/guides/plugin/guide-java-plugin-development.html)
 - [Documentation CVSS v3.1](https://www.first.org/cvss/)
