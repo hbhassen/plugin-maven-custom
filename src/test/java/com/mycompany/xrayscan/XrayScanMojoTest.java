@@ -3,6 +3,10 @@ package com.mycompany.xrayscan;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
+import org.apache.maven.artifact.Artifact;
+import org.apache.maven.artifact.DefaultArtifact;
+import org.apache.maven.artifact.handler.DefaultArtifactHandler;
+import org.apache.maven.artifact.versioning.VersionRange;
 import org.apache.maven.model.Build;
 import org.apache.maven.plugin.MojoFailureException;
 import org.apache.maven.project.MavenProject;
@@ -13,6 +17,9 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.Set;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
@@ -54,7 +61,8 @@ class XrayScanMojoTest {
                                 "\"severity\":\"Medium\"," +
                                 "\"summary\":\"Test vulnerability\"}]}")));
 
-        XrayScanMojo mojo = newMojo("default", true);
+        XrayScanMojo mojo = newMojo("default", true,
+                artifact("org.apache.logging.log4j", "log4j-core", "2.19.0", Artifact.SCOPE_COMPILE));
 
         mojo.execute();
 
@@ -86,7 +94,8 @@ class XrayScanMojoTest {
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"threshold\":8.5}")));
 
-        XrayScanMojo mojo = newMojo("critical-watch", true);
+        XrayScanMojo mojo = newMojo("critical-watch", true,
+                artifact("commons-io", "commons-io", "2.6", Artifact.SCOPE_COMPILE));
 
         assertThatThrownBy(mojo::execute)
                 .isInstanceOf(MojoFailureException.class)
@@ -117,7 +126,9 @@ class XrayScanMojoTest {
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"threshold\":8.5}")));
 
-        XrayScanMojo mojo = newMojo("custom-watch", true);
+        XrayScanMojo mojo = newMojo("custom-watch", true,
+                artifact("commons-io", "commons-io", "2.6", Artifact.SCOPE_COMPILE),
+                artifact("com.google.guava", "guava", "32.0", Artifact.SCOPE_COMPILE));
 
         assertThatThrownBy(mojo::execute)
                 .isInstanceOf(MojoFailureException.class);
@@ -144,14 +155,63 @@ class XrayScanMojoTest {
                 .withQueryParam("watch", equalTo("default"))
                 .willReturn(aResponse().withStatus(401)));
 
-        XrayScanMojo mojo = newMojo("default", true);
+        XrayScanMojo mojo = newMojo("default", true,
+                artifact("org.apache.logging.log4j", "log4j-core", "2.19.0", Artifact.SCOPE_COMPILE));
 
         assertThatThrownBy(mojo::execute)
                 .isInstanceOf(MojoFailureException.class)
                 .hasMessageContaining("Authentification Xray");
     }
 
-    private XrayScanMojo newMojo(String watch, boolean failOnThreshold) throws Exception {
+    @Test
+    void shouldIgnoreViolationsOutsideCompileScope() throws Exception {
+        stubFor(get(urlPathEqualTo("/api/v2/violations"))
+                .withQueryParam("watch", equalTo("default"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"violations\":[{" +
+                                "\"cve\":\"CVE-2024-7777\"," +
+                                "\"components\":[{\"name\":\"junit-jupiter\",\"version\":\"5.10.2\"}]," +
+                                "\"cvss_score\":9.3," +
+                                "\"severity\":\"Critical\"," +
+                                "\"summary\":\"Test scope vulnerability\"}]}")));
+
+        XrayScanMojo mojo = newMojo("default", true,
+                artifact("org.junit.jupiter", "junit-jupiter", "5.10.2", Artifact.SCOPE_TEST));
+
+        mojo.execute();
+
+        Path report = buildDirectory.resolve("xray-scan-report.json");
+        assertThat(Files.exists(report)).isTrue();
+        JsonNode results = MAPPER.readTree(report.toFile());
+        assertThat(results.isArray()).isTrue();
+        assertThat(results).isEmpty();
+    }
+
+    @Test
+    void shouldConsiderDependenciesWithoutExplicitScope() throws Exception {
+        stubFor(get(urlPathEqualTo("/api/v2/violations"))
+                .withQueryParam("watch", equalTo("default"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"violations\":[{" +
+                                "\"cve\":\"CVE-2024-8888\"," +
+                                "\"components\":[{\"name\":\"custom-lib\",\"version\":\"1.0.0\"}]," +
+                                "\"cvss_score\":9.0," +
+                                "\"severity\":\"Critical\"," +
+                                "\"summary\":\"Default scope vulnerability\"}]}")));
+
+        XrayScanMojo mojo = newMojo("default", true,
+                artifact("com.mycompany", "custom-lib", "1.0.0", null));
+
+        assertThatThrownBy(mojo::execute)
+                .isInstanceOf(MojoFailureException.class)
+                .hasMessageContaining("vulnérabilité(s) critique(s)");
+    }
+
+    private XrayScanMojo newMojo(String watch, boolean failOnThreshold, Artifact... artifacts) throws Exception {
         XrayScanMojo mojo = new XrayScanMojo();
         setField(mojo, "xrayUrl", wireMock.baseUrl() + "/api/v2");
         setField(mojo, "username", "user");
@@ -165,8 +225,19 @@ class XrayScanMojoTest {
         Build build = new Build();
         build.setDirectory(buildDirectory.toString());
         project.setBuild(build);
+        Set<Artifact> artifactSet = new LinkedHashSet<>(Arrays.asList(artifacts));
+        project.setArtifacts(artifactSet);
+        project.setDependencyArtifacts(artifactSet);
         setField(mojo, "project", project);
         return mojo;
+    }
+
+    private Artifact artifact(String groupId, String artifactId, String version, String scope) {
+        DefaultArtifactHandler handler = new DefaultArtifactHandler("jar");
+        DefaultArtifact artifact = new DefaultArtifact(groupId, artifactId,
+                VersionRange.createFromVersion(version), scope, "jar", null, handler);
+        artifact.setFile(null);
+        return artifact;
     }
 
     private void setField(Object target, String fieldName, Object value) throws Exception {
