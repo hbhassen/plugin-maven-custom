@@ -24,8 +24,10 @@ import java.util.Set;
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.stubFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.verify;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -209,6 +211,35 @@ class XrayScanMojoTest {
         assertThatThrownBy(mojo::execute)
                 .isInstanceOf(MojoFailureException.class)
                 .hasMessageContaining("vulnérabilité(s) critique(s)");
+    }
+
+    @Test
+    void shouldEncodeCustomWatchNamesForThresholdLookup() throws Exception {
+        stubFor(get(urlPathEqualTo("/api/v2/violations"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"violations\":[]}")));
+        stubFor(get(urlPathEqualTo("/api/v2/watches/custom%20watch"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"threshold\":7.0}")));
+
+        XrayScanMojo mojo = newMojo("custom watch", true,
+                artifact("org.apache.logging.log4j", "log4j-core", "2.19.0", Artifact.SCOPE_COMPILE));
+
+        mojo.execute();
+
+        Path report = buildDirectory.resolve("xray-scan-report.json");
+        assertThat(Files.exists(report)).isTrue();
+        JsonNode results = MAPPER.readTree(report.toFile());
+        assertThat(results.isArray()).isTrue();
+        assertThat(results).isEmpty();
+
+        verify(getRequestedFor(urlPathEqualTo("/api/v2/violations"))
+                .withQueryParam("watch", equalTo("custom watch")));
+        verify(getRequestedFor(urlPathEqualTo("/api/v2/watches/custom%20watch")));
     }
 
     private XrayScanMojo newMojo(String watch, boolean failOnThreshold, Artifact... artifacts) throws Exception {
