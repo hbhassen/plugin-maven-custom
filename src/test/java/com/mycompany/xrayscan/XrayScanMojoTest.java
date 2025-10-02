@@ -94,6 +94,51 @@ class XrayScanMojoTest {
     }
 
     @Test
+    void shouldIncludeAllViolationsInGeneratedReport() throws Exception {
+        stubFor(get(urlPathEqualTo("/api/v2/violations"))
+                .withQueryParam("watch", equalTo("custom-watch"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"violations\":[{" +
+                                "\"cve\":\"CVE-2024-1234\"," +
+                                "\"components\":[{\"name\":\"commons-io\",\"version\":\"2.6\",\"fixed_versions\":[\"2.7\"]}]," +
+                                "\"cvss_score\":9.1," +
+                                "\"severity\":\"Critical\"," +
+                                "\"summary\":\"Critical vulnerability\"},{" +
+                                "\"cve\":\"CVE-2024-5678\"," +
+                                "\"components\":[{\"name\":\"guava\",\"version\":\"32.0\",\"fixed_versions\":[\"32.1\"]}]," +
+                                "\"cvss_score\":4.3," +
+                                "\"severity\":\"Medium\"," +
+                                "\"summary\":\"Moderate vulnerability\"}]}")));
+        stubFor(get(urlPathEqualTo("/api/v2/watches/custom-watch"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"threshold\":8.5}")));
+
+        XrayScanMojo mojo = newMojo("custom-watch", true);
+
+        assertThatThrownBy(mojo::execute)
+                .isInstanceOf(MojoFailureException.class);
+
+        Path report = buildDirectory.resolve("xray-scan-report.json");
+        assertThat(Files.exists(report)).isTrue();
+        JsonNode results = MAPPER.readTree(report.toFile());
+        assertThat(results.isArray()).isTrue();
+        assertThat(results.size()).isEqualTo(2);
+
+        JsonNode first = results.get(0);
+        JsonNode second = results.get(1);
+
+        assertThat(first.path("cveId").asText()).isEqualTo("CVE-2024-1234");
+        assertThat(first.path("fixedVersion").asText()).isEqualTo("2.7");
+
+        assertThat(second.path("cveId").asText()).isEqualTo("CVE-2024-5678");
+        assertThat(second.path("fixedVersion").asText()).isEqualTo("32.1");
+    }
+
+    @Test
     void shouldRaiseFailureWhenAuthenticationFails() throws Exception {
         stubFor(get(urlPathEqualTo("/api/v2/violations"))
                 .withQueryParam("watch", equalTo("default"))

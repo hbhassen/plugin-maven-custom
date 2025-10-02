@@ -97,7 +97,8 @@ mvn com.mycompany:xray-scan-maven-plugin:1.0.0:scan \
     "version": "2.17.0",
     "cvssScore": 9.8,
     "severity": "Critical",
-    "summary": "Remote code execution vulnerability"
+    "summary": "Remote code execution vulnerability",
+    "fixedVersion": "2.17.1"
   }
 ]
 ```
