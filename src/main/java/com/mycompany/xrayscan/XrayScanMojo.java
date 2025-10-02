@@ -2,6 +2,7 @@ package com.mycompany.xrayscan;
 
 import com.mycompany.xrayscan.model.CveResult;
 import com.mycompany.xrayscan.utils.ReportWriter;
+import org.apache.maven.artifact.Artifact;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugin.MojoFailureException;
@@ -14,10 +15,13 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.OptionalDouble;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -68,7 +72,8 @@ public class XrayScanMojo extends AbstractMojo {
             getLog().info(String.format(Locale.ROOT, "Utilisation du watch '%s' (seuil=%.1f)", watch, threshold));
 
             List<CveResult> violations = client.fetchViolations(watch);
-            List<CveResult> sorted = new ArrayList<>(violations);
+            List<CveResult> filteredViolations = filterViolationsByCompileScope(violations);
+            List<CveResult> sorted = new ArrayList<>(filteredViolations);
             sorted.sort(Comparator.comparingDouble(CveResult::getCvssScore).reversed());
 
             Path reportPath = getReportPath();
@@ -139,6 +144,117 @@ public class XrayScanMojo extends AbstractMojo {
                 ? project.getBuild().getDirectory()
                 : "target";
         return Path.of(buildDirectory, "xray-scan-report.json");
+    }
+
+    private List<CveResult> filterViolationsByCompileScope(List<CveResult> violations) {
+        if (violations == null || violations.isEmpty()) {
+            return List.of();
+        }
+        Set<String> allowedNames = resolveCompileScopeDependencyNames();
+        if (allowedNames.isEmpty()) {
+            return List.of();
+        }
+        return violations.stream()
+                .filter(violation -> matchesDependency(allowedNames, violation))
+                .collect(Collectors.toList());
+    }
+
+    private Set<String> resolveCompileScopeDependencyNames() {
+        if (project == null) {
+            return Set.of();
+        }
+        Collection<Artifact> artifacts = project.getArtifacts();
+        if (artifacts == null || artifacts.isEmpty()) {
+            return Set.of();
+        }
+        Set<String> names = new HashSet<>();
+        for (Artifact artifact : artifacts) {
+            if (!isCompileScope(artifact)) {
+                continue;
+            }
+            addArtifactNames(names, artifact);
+        }
+        return names;
+    }
+
+    private void addArtifactNames(Set<String> names, Artifact artifact) {
+        if (artifact == null) {
+            return;
+        }
+        String groupId = lowerCaseOrNull(artifact.getGroupId());
+        String artifactId = lowerCaseOrNull(artifact.getArtifactId());
+        String version = lowerCaseOrNull(artifact.getVersion());
+        String classifier = lowerCaseOrNull(artifact.getClassifier());
+
+        if (artifactId != null) {
+            names.add(artifactId);
+        }
+        if (groupId != null && artifactId != null) {
+            names.add(groupId + ":" + artifactId);
+            names.add(groupId + "/" + artifactId);
+            names.add("gav://" + groupId + ":" + artifactId);
+        }
+        if (groupId != null && artifactId != null && version != null) {
+            names.add(groupId + ":" + artifactId + ":" + version);
+            names.add(groupId + ":" + artifactId + ":" + version + (classifier != null ? ":" + classifier : ""));
+            names.add(groupId + "/" + artifactId + "/" + version);
+            names.add("gav://" + groupId + ":" + artifactId + ":" + version);
+        }
+        String id = lowerCaseOrNull(artifact.getId());
+        if (id != null) {
+            names.add(id);
+        }
+        String dependencyConflictId = lowerCaseOrNull(artifact.getDependencyConflictId());
+        if (dependencyConflictId != null) {
+            names.add(dependencyConflictId);
+        }
+    }
+
+    private boolean matchesDependency(Set<String> allowedNames, CveResult violation) {
+        if (violation == null) {
+            return false;
+        }
+        String packageName = lowerCaseOrNull(violation.getPackageName());
+        if (packageName == null) {
+            return false;
+        }
+        if (allowedNames.contains(packageName)) {
+            return true;
+        }
+        int lastColon = packageName.lastIndexOf(':');
+        if (lastColon >= 0) {
+            String candidate = packageName.substring(lastColon + 1);
+            if (allowedNames.contains(candidate)) {
+                return true;
+            }
+        }
+        int lastSlash = packageName.lastIndexOf('/');
+        if (lastSlash >= 0) {
+            String candidate = packageName.substring(lastSlash + 1);
+            if (allowedNames.contains(candidate)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isCompileScope(Artifact artifact) {
+        String scope = artifact != null ? artifact.getScope() : null;
+        if (scope == null || scope.isBlank()) {
+            return true;
+        }
+        return Artifact.SCOPE_COMPILE.equals(scope);
+    }
+
+    private String lowerCaseOrNull(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        return trimmed.toLowerCase(Locale.ROOT);
     }
 
     private void logViolations(List<CveResult> violations) {
