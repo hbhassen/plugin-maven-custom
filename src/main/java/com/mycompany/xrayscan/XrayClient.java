@@ -60,7 +60,7 @@ public class XrayClient {
     }
 
     public OptionalDouble fetchThresholdForWatch(String watch) throws IOException, AuthenticationException, WatchNotFoundException {
-        String encodedWatch = URLEncoder.encode(watch, StandardCharsets.UTF_8);
+        String encodedWatch = encodePathSegment(watch);
         URI uri = baseUri.resolve("watches/" + encodedWatch);
         HttpRequest request = HttpRequest.newBuilder(uri)
                 .header("Accept", "application/json")
@@ -352,6 +352,14 @@ public class XrayClient {
         String credentials = username + ":" + password;
         String encoded = Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
         return "Basic " + encoded;
+    }
+
+    private String encodePathSegment(String value) {
+        if (value == null) {
+            return "";
+        }
+        String encoded = URLEncoder.encode(value, StandardCharsets.UTF_8);
+        return encoded.replace("+", "%20");
     }
 
     public static class AuthenticationException extends Exception {
