@@ -20,7 +20,6 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.OptionalDouble;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -41,14 +40,14 @@ public class XrayScanMojo extends AbstractMojo {
     @Parameter(property = "password", required = true)
     private String password;
 
-    @Parameter(property = "watch", defaultValue = "default")
-    private String watch;
-
     @Parameter(property = "failOnThreshold", defaultValue = "true")
     private boolean failOnThreshold;
 
     @Parameter(property = "timeoutSeconds", defaultValue = "300")
     private int timeoutSeconds;
+
+    @Parameter(property = "threshold", defaultValue = "7.0")
+    private double threshold;
 
     @Parameter(defaultValue = "${project}", readonly = true)
     private MavenProject project;
@@ -68,10 +67,21 @@ public class XrayScanMojo extends AbstractMojo {
         Duration timeout = Duration.ofSeconds(Math.max(timeoutSeconds, 1));
         try {
             XrayClient client = new XrayClient(xrayUrl, username, password, timeout, getLog());
-            double threshold = resolveThreshold(client);
-            getLog().info(String.format(Locale.ROOT, "Utilisation du watch '%s' (seuil=%.1f)", watch, threshold));
+            double effectiveThreshold = resolveThreshold();
 
-            List<CveResult> violations = client.fetchViolations(watch);
+            String rootComponentId = resolveProjectComponentId();
+            if (rootComponentId == null) {
+                getLog().warn("Impossible de déterminer le composant racine (groupId:artifactId:version). Scan annulé.");
+                return;
+            }
+
+            Set<String> dependencyComponentIds = resolveDependencyComponentIds();
+            getLog().info(String.format(Locale.ROOT,
+                    "Scan On-Demand Xray du composant '%s' avec %d dépendance(s) compile.",
+                    rootComponentId,
+                    dependencyComponentIds.size()));
+
+            List<CveResult> violations = client.runDependencyScan(rootComponentId, dependencyComponentIds);
             List<CveResult> filteredViolations = filterViolationsByCompileScope(violations);
             List<CveResult> sorted = new ArrayList<>(filteredViolations);
             sorted.sort(Comparator.comparingDouble(CveResult::getCvssScore).reversed());
@@ -81,7 +91,7 @@ public class XrayScanMojo extends AbstractMojo {
             getLog().info("Rapport JSON généré dans " + reportPath);
 
             List<CveResult> aboveThreshold = sorted.stream()
-                    .filter(v -> v.getCvssScore() >= threshold)
+                    .filter(v -> v.getCvssScore() >= effectiveThreshold)
                     .collect(Collectors.toList());
 
             if (aboveThreshold.isEmpty()) {
@@ -95,7 +105,7 @@ public class XrayScanMojo extends AbstractMojo {
             }
 
             getLog().error(String.format(Locale.ROOT,
-                    "%d vulnérabilité(s) dépassent le seuil CVSS %.1f :", aboveThreshold.size(), threshold));
+                    "%d vulnérabilité(s) dépassent le seuil CVSS %.1f :", aboveThreshold.size(), effectiveThreshold));
             logViolations(aboveThreshold);
 
             if (failOnThreshold) {
@@ -105,8 +115,6 @@ public class XrayScanMojo extends AbstractMojo {
             }
         } catch (XrayClient.AuthenticationException e) {
             throw new MojoFailureException("Authentification Xray échouée : " + e.getMessage(), e);
-        } catch (XrayClient.WatchNotFoundException e) {
-            throw new MojoFailureException("Watch introuvable : " + watch, e);
         } catch (IOException e) {
             throw new MojoExecutionException("Erreur d'appel à l'API JFrog Xray", e);
         }
@@ -124,18 +132,12 @@ public class XrayScanMojo extends AbstractMojo {
         }
     }
 
-    private double resolveThreshold(XrayClient client)
-            throws IOException, XrayClient.AuthenticationException, XrayClient.WatchNotFoundException {
-        if ("default".equalsIgnoreCase(watch)) {
-            return DEFAULT_THRESHOLD;
-        }
-        OptionalDouble threshold = client.fetchThresholdForWatch(watch);
-        if (threshold.isPresent()) {
-            return threshold.getAsDouble();
+    private double resolveThreshold() {
+        if (threshold > 0) {
+            return threshold;
         }
         getLog().warn(String.format(Locale.ROOT,
-                "Impossible de déterminer le seuil du watch '%s'. Utilisation du seuil par défaut %.1f.",
-                watch, DEFAULT_THRESHOLD));
+                "Seuil invalide (%.2f). Utilisation du seuil par défaut %.1f.", threshold, DEFAULT_THRESHOLD));
         return DEFAULT_THRESHOLD;
     }
 
@@ -144,6 +146,40 @@ public class XrayScanMojo extends AbstractMojo {
                 ? project.getBuild().getDirectory()
                 : "target";
         return Path.of(buildDirectory, "xray-scan-report.json");
+    }
+
+    private String resolveProjectComponentId() {
+        if (project == null) {
+            return null;
+        }
+        String groupId = normalizeCoordinate(project.getGroupId());
+        String artifactId = normalizeCoordinate(project.getArtifactId());
+        String version = normalizeCoordinate(project.getVersion());
+        if (groupId == null || artifactId == null || version == null) {
+            return null;
+        }
+        return "gav://" + groupId + ":" + artifactId + ":" + version;
+    }
+
+    private Set<String> resolveDependencyComponentIds() {
+        if (project == null) {
+            return Set.of();
+        }
+        Collection<Artifact> artifacts = project.getArtifacts();
+        if (artifacts == null || artifacts.isEmpty()) {
+            return Set.of();
+        }
+        Set<String> componentIds = new HashSet<>();
+        for (Artifact artifact : artifacts) {
+            if (!isCompileScope(artifact)) {
+                continue;
+            }
+            String componentId = toComponentId(artifact);
+            if (componentId != null) {
+                componentIds.add(componentId);
+            }
+        }
+        return componentIds;
     }
 
     private List<CveResult> filterViolationsByCompileScope(List<CveResult> violations) {
@@ -163,11 +199,15 @@ public class XrayScanMojo extends AbstractMojo {
         if (project == null) {
             return Set.of();
         }
+        Set<String> names = new HashSet<>();
+        Artifact mainArtifact = project.getArtifact();
+        if (mainArtifact != null) {
+            addArtifactNames(names, mainArtifact);
+        }
         Collection<Artifact> artifacts = project.getArtifacts();
         if (artifacts == null || artifacts.isEmpty()) {
-            return Set.of();
+            return names;
         }
-        Set<String> names = new HashSet<>();
         for (Artifact artifact : artifacts) {
             if (!isCompileScope(artifact)) {
                 continue;
@@ -175,6 +215,37 @@ public class XrayScanMojo extends AbstractMojo {
             addArtifactNames(names, artifact);
         }
         return names;
+    }
+
+    private String toComponentId(Artifact artifact) {
+        if (artifact == null) {
+            return null;
+        }
+        String groupId = normalizeCoordinate(artifact.getGroupId());
+        String artifactId = normalizeCoordinate(artifact.getArtifactId());
+        String version = normalizeCoordinate(artifact.getVersion());
+        String classifier = normalizeCoordinate(artifact.getClassifier());
+        if (groupId == null || artifactId == null || version == null) {
+            return null;
+        }
+        StringBuilder builder = new StringBuilder("gav://")
+                .append(groupId)
+                .append(":")
+                .append(artifactId)
+                .append(":")
+                .append(version);
+        if (classifier != null && !classifier.isBlank()) {
+            builder.append(":").append(classifier);
+        }
+        return builder.toString();
+    }
+
+    private String normalizeCoordinate(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
     }
 
     private void addArtifactNames(Set<String> names, Artifact artifact) {
