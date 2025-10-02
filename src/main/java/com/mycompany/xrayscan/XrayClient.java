@@ -16,23 +16,16 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
 /**
- * Client HTTP léger pour consommer l'API JFrog Xray.
+ * Client HTTP dédié à la consommation de l'API JFrog Xray (REST v2).
  */
 public class XrayClient {
-
-    private static final String GRAPH_SCAN_PATH = "../v1/scan/graph";
-    private static final String SCAN_TYPE_DEPENDENCY = "dependency";
-    private static final Duration DEFAULT_POLL_INTERVAL = Duration.ofSeconds(3);
-    private static final Duration DEFAULT_POLL_TIMEOUT = Duration.ofMinutes(15);
 
     private static final double DEFAULT_CRITICAL_THRESHOLD = 9.0;
     private static final double DEFAULT_HIGH_THRESHOLD = 7.0;
@@ -55,245 +48,209 @@ public class XrayClient {
         this.log = log;
     }
 
-    public List<CveResult> runDependencyScan(String rootComponentId, Set<String> dependencyComponentIds)
-            throws IOException, AuthenticationException {
-        if (rootComponentId == null || rootComponentId.isBlank()) {
-            return List.of();
+    public List<CveResult> fetchViolations(String watch) throws IOException, AuthenticationException {
+        StringBuilder path = new StringBuilder("violations");
+        if (watch != null && !watch.isBlank()) {
+            path.append("?watch=").append(encodeQueryParam(watch));
         }
-        GraphNode root = new GraphNode(rootComponentId.trim());
-        if (dependencyComponentIds != null) {
-            dependencyComponentIds.stream()
-                    .filter(Objects::nonNull)
-                    .map(String::trim)
-                    .filter(value -> !value.isEmpty())
-                    .map(GraphNode::new)
-                    .forEach(root::addNode);
-        }
-        return executeScan(root, SCAN_TYPE_DEPENDENCY);
-    }
-
-    private List<CveResult> executeScan(GraphNode graph, String scanType)
-            throws IOException, AuthenticationException {
-        if (graph == null) {
-            return List.of();
-        }
-        String requestBody = mapper.writeValueAsString(graph);
-        URI scanUri = buildGraphScanUri("?scan_type=" + scanType);
-        HttpRequest request = HttpRequest.newBuilder(scanUri)
+        URI uri = buildUri(path.toString());
+        HttpRequest request = HttpRequest.newBuilder(uri)
                 .header("Accept", "application/json")
-                .header("Content-Type", "application/json")
                 .header("Authorization", authorizationHeader)
-                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                .GET()
                 .build();
 
-        HttpResponse<String> response = send(request, Set.of(200, 201));
-        JsonNode root = parseJson(response.body());
-        String scanId = root.path("scan_id").asText(null);
-        if (scanId == null || scanId.isBlank()) {
-            throw new IOException("Réponse Xray invalide : scan_id manquant");
-        }
-        return pollScanResults(scanId);
+        HttpResponse<String> response = send(request, Set.of(200));
+        JsonNode body = parseJson(response.body());
+        return parseViolations(body);
     }
 
-    private List<CveResult> pollScanResults(String scanId)
-            throws IOException, AuthenticationException {
-        Duration timeout = DEFAULT_POLL_TIMEOUT;
-        long deadline = System.nanoTime() + timeout.toNanos();
-        URI resultsUri = buildGraphScanUri("/" + encodePathSegment(scanId) + "?include_vulnerabilities=true");
-
-        while (true) {
-            HttpRequest request = HttpRequest.newBuilder(resultsUri)
-                    .header("Accept", "application/json")
-                    .header("Authorization", authorizationHeader)
-                    .GET()
-                    .build();
-
-            HttpResponse<String> response = send(request, Set.of(200, 202));
-            if (response.statusCode() == 202) {
-                if (System.nanoTime() > deadline) {
-                    throw new IOException("Timeout lors de la récupération des résultats de scan Xray");
-                }
-                sleep(DEFAULT_POLL_INTERVAL);
-                continue;
-            }
-
-            JsonNode root = parseJson(response.body());
-            return extractScanResults(root);
+    public Double fetchWatchThreshold(String watch) throws IOException, AuthenticationException {
+        if (watch == null || watch.isBlank()) {
+            return null;
         }
+        URI uri = buildUri("watches/" + encodePathSegment(watch));
+        HttpRequest request = HttpRequest.newBuilder(uri)
+                .header("Accept", "application/json")
+                .header("Authorization", authorizationHeader)
+                .GET()
+                .build();
+
+        HttpResponse<String> response = send(request, Set.of(200));
+        JsonNode body = parseJson(response.body());
+        double threshold = extractThresholdFromWatch(body);
+        return threshold > 0 ? threshold : null;
     }
 
-    private List<CveResult> extractScanResults(JsonNode root) {
-        Set<CveResult> uniqueResults = new LinkedHashSet<>();
+    private List<CveResult> parseViolations(JsonNode root) {
         if (root == null || root.isMissingNode()) {
             return List.of();
         }
+        Set<CveResult> results = new LinkedHashSet<>();
         JsonNode violations = root.path("violations");
         if (violations.isArray()) {
             for (JsonNode violation : violations) {
-                collectResultsFromIssue(violation, uniqueResults);
+                collectResultsFromViolation(violation, results);
             }
         }
         JsonNode vulnerabilities = root.path("vulnerabilities");
         if (vulnerabilities.isArray()) {
             for (JsonNode vulnerability : vulnerabilities) {
-                collectResultsFromIssue(vulnerability, uniqueResults);
+                collectResultsFromViolation(vulnerability, results);
             }
         }
-        return new ArrayList<>(uniqueResults);
+        return new ArrayList<>(results);
     }
 
-    private void collectResultsFromIssue(JsonNode issueNode, Set<CveResult> target) {
-        if (issueNode == null || issueNode.isMissingNode()) {
+    private void collectResultsFromViolation(JsonNode violation, Set<CveResult> target) {
+        if (violation == null || violation.isMissingNode()) {
             return;
         }
-        String severity = issueNode.path("severity").asText(null);
-        String summary = issueNode.path("summary").asText(null);
-        String cveId = resolveCveId(issueNode);
-        double cvssScore = resolveCvssScore(issueNode, severity);
-        JsonNode componentsNode = issueNode.path("components");
-        if (componentsNode != null && componentsNode.isObject() && componentsNode.size() > 0) {
-            Iterator<Map.Entry<String, JsonNode>> fields = componentsNode.fields();
-            while (fields.hasNext()) {
-                Map.Entry<String, JsonNode> entry = fields.next();
-                String componentId = entry.getKey();
-                PackageInfo info = parseComponentId(componentId);
-                JsonNode componentDetails = entry.getValue();
-                String fixedVersion = firstTextFromArray(componentDetails.path("fixed_versions"));
-                CveResult result = new CveResult(
-                        cveId,
-                        info.packageName,
-                        info.version,
-                        cvssScore,
-                        severity != null ? severity : "",
-                        summary,
-                        fixedVersion);
-                target.add(result);
+        String severity = violation.path("severity").asText("");
+        String summary = violation.path("summary").asText("");
+        String cveId = resolveCveId(violation);
+        double cvssScore = resolveCvssScore(violation, severity);
+
+        JsonNode components = violation.path("components");
+        if (components.isArray() && components.size() > 0) {
+            for (JsonNode component : components) {
+                String name = component.path("name").asText("");
+                String version = component.path("version").asText("");
+                String fixedVersion = firstTextFromArray(component.path("fixed_versions"));
+                if (fixedVersion.isBlank()) {
+                    fixedVersion = firstTextFromArray(component.path("fixedVersions"));
+                }
+                target.add(new CveResult(cveId, name, version, cvssScore, severity, summary, fixedVersion));
             }
-        } else {
-            // Fallback without component mapping
-            CveResult result = new CveResult(
-                    cveId,
-                    "",
-                    "",
-                    cvssScore,
-                    severity != null ? severity : "",
-                    summary,
-                    "");
-            target.add(result);
+            return;
         }
+
+        JsonNode impacted = violation.path("impacted_artifacts");
+        if (impacted.isArray() && impacted.size() > 0) {
+            for (JsonNode component : impacted) {
+                String name = component.path("name").asText("");
+                String version = component.path("version").asText("");
+                String fixedVersion = firstTextFromArray(component.path("fixed_versions"));
+                target.add(new CveResult(cveId, name, version, cvssScore, severity, summary, fixedVersion));
+            }
+            return;
+        }
+
+        target.add(new CveResult(cveId, "", "", cvssScore, severity, summary, ""));
     }
 
-    private String resolveCveId(JsonNode issueNode) {
-        if (issueNode == null) {
+    private String resolveCveId(JsonNode violation) {
+        if (violation == null) {
             return "";
         }
-        ArrayNode cves = issueNode.path("cves").isArray() ? (ArrayNode) issueNode.path("cves") : null;
+        String direct = violation.path("cve").asText(null);
+        if (direct != null && !direct.isBlank()) {
+            return direct;
+        }
+        ArrayNode cves = violation.path("cves").isArray() ? (ArrayNode) violation.path("cves") : null;
         if (cves != null && cves.size() > 0) {
-            JsonNode first = cves.get(0);
-            if (first != null) {
-                String id = first.path("cve").asText(null);
-                if (id == null || id.isBlank()) {
-                    id = first.path("id").asText(null);
+            for (JsonNode cveNode : cves) {
+                String candidate = cveNode.path("cve").asText(null);
+                if (candidate == null || candidate.isBlank()) {
+                    candidate = cveNode.path("id").asText(null);
                 }
-                if (id != null && !id.isBlank()) {
-                    return id;
+                if (candidate != null && !candidate.isBlank()) {
+                    return candidate;
                 }
             }
         }
-        String issueId = issueNode.path("issue_id").asText(null);
+        String issueId = violation.path("issue_id").asText(null);
         if (issueId != null && !issueId.isBlank()) {
             return issueId;
         }
         return "";
     }
 
-    private double resolveCvssScore(JsonNode issueNode, String severity) {
-        if (issueNode == null) {
-            return 0.0;
+    private double resolveCvssScore(JsonNode violation, String severity) {
+        double direct = parseScore(violation.path("cvssScore"));
+        if (direct <= 0) {
+            direct = parseScore(violation.path("cvss_score"));
         }
-        ArrayNode cves = issueNode.path("cves").isArray() ? (ArrayNode) issueNode.path("cves") : null;
+        if (direct <= 0) {
+            direct = parseScore(violation.path("cvss_v3_score"));
+        }
+        if (direct <= 0) {
+            direct = parseScore(violation.path("cvss_v2_score"));
+        }
+        if (direct > 0) {
+            return direct;
+        }
+        ArrayNode cves = violation.path("cves").isArray() ? (ArrayNode) violation.path("cves") : null;
         if (cves != null) {
-            for (JsonNode cve : cves) {
-                double score = parseScore(cve.path("cvss_v3_score"));
+            for (JsonNode cveNode : cves) {
+                double score = parseScore(cveNode.path("cvss_v3_score"));
                 if (score <= 0) {
-                    score = parseScore(cve.path("cvss_v2_score"));
+                    score = parseScore(cveNode.path("cvss_v2_score"));
                 }
                 if (score > 0) {
                     return score;
                 }
             }
         }
-        double issueScore = parseScore(issueNode.path("cvss_v3_score"));
-        if (issueScore <= 0) {
-            issueScore = parseScore(issueNode.path("cvss_v2_score"));
-        }
-        if (issueScore > 0) {
-            return issueScore;
-        }
         return mapSeverityToScore(severity);
     }
 
-    private double parseScore(JsonNode node) {
-        if (node == null || node.isMissingNode()) {
+    private double extractThresholdFromWatch(JsonNode watchNode) {
+        if (watchNode == null || watchNode.isMissingNode()) {
             return 0.0;
         }
-        if (node.isNumber()) {
-            return node.asDouble();
+        double threshold = parseScore(watchNode.path("threshold"));
+        if (threshold > 0) {
+            return threshold;
         }
-        if (node.isTextual()) {
-            String text = node.asText();
-            try {
-                return Double.parseDouble(text);
-            } catch (NumberFormatException ignored) {
-                return 0.0;
+        String severity = watchNode.path("severity").asText(null);
+        if (severity != null && !severity.isBlank()) {
+            return mapSeverityToScore(severity);
+        }
+        double fromRules = extractThresholdFromPolicyRules(watchNode.path("policy_rules"));
+        if (fromRules > 0) {
+            return fromRules;
+        }
+        JsonNode policies = watchNode.path("policies");
+        if (policies.isArray()) {
+            for (JsonNode policy : policies) {
+                double candidate = extractThresholdFromPolicyRules(policy.path("policy_rules"));
+                if (candidate > 0) {
+                    return candidate;
+                }
+                candidate = extractThresholdFromPolicyRules(policy.path("rules"));
+                if (candidate > 0) {
+                    return candidate;
+                }
             }
         }
         return 0.0;
     }
 
-    private PackageInfo parseComponentId(String componentId) {
-        if (componentId == null || componentId.isBlank()) {
-            return new PackageInfo("", "");
+    private double extractThresholdFromPolicyRules(JsonNode rulesNode) {
+        if (!rulesNode.isArray()) {
+            return 0.0;
         }
-        String normalized = componentId.trim();
-        int schemeIndex = normalized.indexOf("://");
-        if (schemeIndex >= 0) {
-            normalized = normalized.substring(schemeIndex + 3);
-        }
-        String[] parts = normalized.split(":");
-        if (parts.length >= 3) {
-            String name = parts[0] + ":" + parts[1];
-            StringBuilder versionBuilder = new StringBuilder(parts[2]);
-            for (int i = 3; i < parts.length; i++) {
-                if (!parts[i].isBlank()) {
-                    versionBuilder.append(":").append(parts[i]);
-                }
+        double minThreshold = Double.POSITIVE_INFINITY;
+        for (JsonNode rule : rulesNode) {
+            double candidate = parseScore(rule.path("threshold"));
+            if (candidate > 0) {
+                minThreshold = Math.min(minThreshold, candidate);
             }
-            return new PackageInfo(name, versionBuilder.toString());
+            JsonNode criteria = rule.path("criteria");
+            if (criteria.isMissingNode()) {
+                criteria = rule;
+            }
+            double cvss = parseScore(criteria.path("cvss_threshold"));
+            if (cvss > 0) {
+                minThreshold = Math.min(minThreshold, cvss);
+            }
+            String minSeverity = criteria.path("min_severity").asText(null);
+            if (minSeverity != null && !minSeverity.isBlank()) {
+                minThreshold = Math.min(minThreshold, mapSeverityToScore(minSeverity));
+            }
         }
-        if (parts.length == 2) {
-            return new PackageInfo(parts[0], parts[1]);
-        }
-        return new PackageInfo(normalized, "");
-    }
-
-    private double mapSeverityToScore(String severity) {
-        if (severity == null) {
-            return DEFAULT_HIGH_THRESHOLD;
-        }
-        switch (severity.toLowerCase(Locale.ROOT)) {
-            case "critical":
-                return DEFAULT_CRITICAL_THRESHOLD;
-            case "high":
-                return DEFAULT_HIGH_THRESHOLD;
-            case "medium":
-            case "moderate":
-                return DEFAULT_MEDIUM_THRESHOLD;
-            case "low":
-                return DEFAULT_LOW_THRESHOLD;
-            default:
-                return DEFAULT_HIGH_THRESHOLD;
-        }
+        return minThreshold == Double.POSITIVE_INFINITY ? 0.0 : minThreshold;
     }
 
     private HttpResponse<String> send(HttpRequest request, Set<Integer> allowedStatuses)
@@ -323,15 +280,6 @@ public class XrayClient {
         }
     }
 
-    private void sleep(Duration duration) throws IOException {
-        try {
-            Thread.sleep(Math.max(duration.toMillis(), 50));
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Attente interrompue", e);
-        }
-    }
-
     private JsonNode parseJson(String body) throws IOException {
         if (body == null || body.isBlank()) {
             return mapper.createObjectNode();
@@ -339,45 +287,41 @@ public class XrayClient {
         return mapper.readTree(body);
     }
 
-    private URI buildGraphScanUri(String suffix) {
-        URI graphBase = baseUri.resolve(GRAPH_SCAN_PATH);
-        String base = graphBase.toString();
+    private URI buildUri(String suffix) {
         if (suffix == null || suffix.isBlank()) {
-            return graphBase;
-        }
-        if (suffix.startsWith("?")) {
-            return URI.create(base + suffix);
+            return baseUri;
         }
         if (suffix.startsWith("/")) {
-            return URI.create(base + suffix);
+            return baseUri.resolve(suffix.substring(1));
         }
-        return URI.create(base + "/" + suffix);
+        return baseUri.resolve(suffix);
     }
 
     private URI normalizeBaseUri(String baseUrl) {
+        Objects.requireNonNull(baseUrl, "baseUrl");
         String normalized = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
         return URI.create(normalized);
     }
 
     private String buildAuthorizationHeader(String username, String password) {
-        String credentials = username + ":" + password;
+        String credentials = (username != null ? username : "") + ":" + (password != null ? password : "");
         String encoded = Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
         return "Basic " + encoded;
     }
 
-    private String encodePathSegment(String value) {
-        if (value == null) {
-            return "";
-        }
-        String encoded = URLEncoder.encode(value, StandardCharsets.UTF_8);
-        return encoded.replace("+", "%20");
+    private String encodeQueryParam(String value) {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
     }
 
-    private String firstTextFromArray(JsonNode arrayNode) {
-        if (arrayNode == null || !arrayNode.isArray()) {
+    private String encodePathSegment(String value) {
+        return encodeQueryParam(value).replace("%2F", "/");
+    }
+
+    private String firstTextFromArray(JsonNode node) {
+        if (node == null || !node.isArray()) {
             return "";
         }
-        for (JsonNode element : arrayNode) {
+        for (JsonNode element : node) {
             if (element != null) {
                 String text = element.asText(null);
                 if (text != null && !text.isBlank()) {
@@ -388,42 +332,45 @@ public class XrayClient {
         return "";
     }
 
+    private double parseScore(JsonNode node) {
+        if (node == null || node.isMissingNode()) {
+            return 0.0;
+        }
+        if (node.isNumber()) {
+            return node.asDouble();
+        }
+        if (node.isTextual()) {
+            try {
+                return Double.parseDouble(node.asText());
+            } catch (NumberFormatException ignored) {
+                return 0.0;
+            }
+        }
+        return 0.0;
+    }
+
+    private double mapSeverityToScore(String severity) {
+        if (severity == null) {
+            return DEFAULT_HIGH_THRESHOLD;
+        }
+        switch (severity.toLowerCase(Locale.ROOT)) {
+            case "critical":
+                return DEFAULT_CRITICAL_THRESHOLD;
+            case "high":
+                return DEFAULT_HIGH_THRESHOLD;
+            case "medium":
+            case "moderate":
+                return DEFAULT_MEDIUM_THRESHOLD;
+            case "low":
+                return DEFAULT_LOW_THRESHOLD;
+            default:
+                return DEFAULT_HIGH_THRESHOLD;
+        }
+    }
+
     public static class AuthenticationException extends Exception {
         public AuthenticationException(String message) {
             super(message);
-        }
-    }
-
-    private static class GraphNode {
-        private final String component_id;
-        private final List<GraphNode> nodes = new ArrayList<>();
-
-        GraphNode(String componentId) {
-            this.component_id = componentId;
-        }
-
-        void addNode(GraphNode child) {
-            if (child != null) {
-                nodes.add(child);
-            }
-        }
-
-        public String getComponent_id() {
-            return component_id;
-        }
-
-        public List<GraphNode> getNodes() {
-            return nodes;
-        }
-    }
-
-    private static class PackageInfo {
-        private final String packageName;
-        private final String version;
-
-        PackageInfo(String packageName, String version) {
-            this.packageName = packageName;
-            this.version = version;
         }
     }
 }
