@@ -138,8 +138,9 @@ public class XrayClient {
             String summary = firstNonBlank(
                     violationNode.path("summary").asText(null),
                     violationNode.path("description").asText(null));
+            String fixedVersion = findFixedVersion(violationNode);
 
-            CveResult result = new CveResult(cveId, packageName, version, cvssScore, severity, summary);
+            CveResult result = new CveResult(cveId, packageName, version, cvssScore, severity, summary, fixedVersion);
             results.add(result);
         }
         return results;
@@ -173,6 +174,25 @@ public class XrayClient {
         return firstNonBlank(
                 violationNode.path("version").asText(null),
                 violationNode.path("component_version").asText(null));
+    }
+
+    private String findFixedVersion(JsonNode violationNode) {
+        if (violationNode.has("components") && violationNode.path("components").isArray()) {
+            JsonNode component = violationNode.path("components").get(0);
+            if (component != null) {
+                String fixedVersion = firstNonBlank(
+                        firstTextFromArray(component.path("fixed_versions")),
+                        component.path("fixed_version").asText(null),
+                        component.path("fix_version").asText(null));
+                if (fixedVersion != null) {
+                    return fixedVersion;
+                }
+            }
+        }
+        return firstNonBlank(
+                firstTextFromArray(violationNode.path("fixed_versions")),
+                violationNode.path("fixed_version").asText(null),
+                violationNode.path("fix_version").asText(null));
     }
 
     private double findCvssScore(JsonNode violationNode) {
@@ -296,6 +316,21 @@ public class XrayClient {
         for (String value : values) {
             if (value != null && !value.isBlank()) {
                 return value;
+            }
+        }
+        return null;
+    }
+
+    private String firstTextFromArray(JsonNode arrayNode) {
+        if (arrayNode == null || !arrayNode.isArray()) {
+            return null;
+        }
+        for (JsonNode element : arrayNode) {
+            if (element != null) {
+                String text = element.asText(null);
+                if (text != null && !text.isBlank()) {
+                    return text;
+                }
             }
         }
         return null;
