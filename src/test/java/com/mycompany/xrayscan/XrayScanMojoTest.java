@@ -49,7 +49,7 @@ class XrayScanMojoTest {
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"violations\":[{" +
                                 "\"cve\":\"CVE-2024-0001\"," +
-                                "\"components\":[{\"name\":\"log4j-core\",\"version\":\"2.19.0\"}]," +
+                                "\"components\":[{\"name\":\"log4j-core\",\"version\":\"2.19.0\",\"fixed_versions\":[\"2.19.1\"]}]," +
                                 "\"cvss_score\":6.5," +
                                 "\"severity\":\"Medium\"," +
                                 "\"summary\":\"Test vulnerability\"}]}")));
@@ -64,6 +64,7 @@ class XrayScanMojoTest {
         assertThat(results.isArray()).isTrue();
         assertThat(results.size()).isEqualTo(1);
         assertThat(results.get(0).path("cvssScore").asDouble()).isEqualTo(6.5);
+        assertThat(results.get(0).path("fixedVersion").asText()).isEqualTo("2.19.1");
     }
 
     @Test
@@ -75,7 +76,7 @@ class XrayScanMojoTest {
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"violations\":[{" +
                                 "\"cve\":\"CVE-2024-9999\"," +
-                                "\"components\":[{\"name\":\"commons-io\",\"version\":\"2.6\"}]," +
+                                "\"components\":[{\"name\":\"commons-io\",\"version\":\"2.6\",\"fixed_versions\":[\"2.7\"]}]," +
                                 "\"cvss_score\":9.1," +
                                 "\"severity\":\"Critical\"," +
                                 "\"summary\":\"Critical vulnerability\"}]}")));

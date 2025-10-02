@@ -146,12 +146,16 @@ public class XrayScanMojo extends AbstractMojo {
             return;
         }
         getLog().info("Liste des vulnérabilités :");
+        getLog().info("Colonnes : CVE | package | version | fixed-version | CVSS | sévérité");
         for (CveResult violation : violations) {
+            String fixedVersion = violation.getFixedVersion();
+            String fixedVersionColumn = (fixedVersion == null || fixedVersion.isBlank()) ? "-" : fixedVersion;
             getLog().info(String.format(Locale.ROOT,
-                    "%s | %s | %s | CVSS=%.1f | %s",
+                    "%s | %s | %s | %s | CVSS=%.1f | %s",
                     violation.getCveId(),
                     violation.getPackageName(),
                     violation.getVersion(),
+                    fixedVersionColumn,
                     violation.getCvssScore(),
                     violation.getSeverity()));
         }
