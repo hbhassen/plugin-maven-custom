@@ -185,7 +185,9 @@ ANNEXE : Comment appliquer la Licence Apache à votre travail.
    description de l'objectif sur la même "page imprimée" que l'avis de droit
    d'auteur pour une identification plus facile dans les archives de tiers.
 
-   Copyright © 2025 Hamdi BEN HASSEN
+
+   Copyright © 2025 Hamdi BEN HASSEN (https://github.com/hbhassen)
+
 
    Sous licence Apache, Version 2.0 (la "Licence") ; vous ne pouvez utiliser ce
    fichier qu'en conformité avec la Licence. Vous pouvez obtenir une copie de la
