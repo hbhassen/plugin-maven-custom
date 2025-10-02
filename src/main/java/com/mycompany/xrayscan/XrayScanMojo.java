@@ -11,7 +11,10 @@ import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.project.MavenProject;
 
+import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -22,6 +25,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 /**
  * Mojo principal déclenchant le scan JFrog Xray.
@@ -49,6 +54,9 @@ public class XrayScanMojo extends AbstractMojo {
     @Parameter(property = "threshold", defaultValue = "7.0")
     private double threshold;
 
+    @Parameter(property = "watch")
+    private String watch;
+
     @Parameter(defaultValue = "${project}", readonly = true)
     private MavenProject project;
 
@@ -69,49 +77,60 @@ public class XrayScanMojo extends AbstractMojo {
             XrayClient client = new XrayClient(xrayUrl, username, password, timeout, getLog());
             double effectiveThreshold = resolveThreshold();
 
-            String rootComponentId = resolveProjectComponentId();
-            if (rootComponentId == null) {
-                getLog().warn("Impossible de déterminer le composant racine (groupId:artifactId:version). Scan annulé.");
+            ArchiveCandidate archiveCandidate = locateArchiveCandidate();
+            if (archiveCandidate == null || archiveCandidate.path() == null) {
+                getLog().warn("Impossible de trouver un binaire ou un répertoire 'target' à envoyer à Xray.");
                 return;
             }
 
-            Set<String> dependencyComponentIds = resolveDependencyComponentIds();
-            getLog().info(String.format(Locale.ROOT,
-                    "Scan On-Demand Xray du composant '%s' avec %d dépendance(s) compile.",
-                    rootComponentId,
-                    dependencyComponentIds.size()));
-
-            List<CveResult> violations = client.runDependencyScan(rootComponentId, dependencyComponentIds);
-            List<CveResult> filteredViolations = filterViolationsByCompileScope(violations);
-            List<CveResult> sorted = new ArrayList<>(filteredViolations);
-            sorted.sort(Comparator.comparingDouble(CveResult::getCvssScore).reversed());
-
-            Path reportPath = getReportPath();
-            new ReportWriter().write(reportPath, sorted);
-            getLog().info("Rapport JSON généré dans " + reportPath);
-
-            List<CveResult> aboveThreshold = sorted.stream()
-                    .filter(v -> v.getCvssScore() >= effectiveThreshold)
-                    .collect(Collectors.toList());
-
-            if (aboveThreshold.isEmpty()) {
-                if (sorted.isEmpty()) {
-                    getLog().info("Aucune vulnérabilité détectée par Xray.");
+            String watchName = normalizeWatch(watch);
+            Path archive = archiveCandidate.path();
+            try {
+                if (watchName != null) {
+                    getLog().info(String.format(Locale.ROOT,
+                            "Scan On-Demand Xray de l'archive '%s' avec le watch '%s'.",
+                            archive.getFileName(),
+                            watchName));
                 } else {
-                    getLog().info("Aucune vulnérabilité ne dépasse le seuil configuré.");
+                    getLog().info(String.format(Locale.ROOT,
+                            "Scan On-Demand Xray de l'archive '%s'.",
+                            archive.getFileName()));
                 }
-                logViolations(sorted);
-                return;
-            }
 
-            getLog().error(String.format(Locale.ROOT,
-                    "%d vulnérabilité(s) dépassent le seuil CVSS %.1f :", aboveThreshold.size(), effectiveThreshold));
-            logViolations(aboveThreshold);
+                List<CveResult> violations = client.scanArchive(archive, watchName);
+                List<CveResult> filteredViolations = filterViolationsByCompileScope(violations);
+                List<CveResult> sorted = new ArrayList<>(filteredViolations);
+                sorted.sort(Comparator.comparingDouble(CveResult::getCvssScore).reversed());
 
-            if (failOnThreshold) {
-                throw new MojoFailureException("Scan Xray échoué : vulnérabilité(s) critique(s) détectée(s).");
-            } else {
-                getLog().warn("Des vulnérabilités dépassent le seuil mais failOnThreshold=false");
+                Path reportPath = getReportPath();
+                new ReportWriter().write(reportPath, sorted);
+                getLog().info("Rapport JSON généré dans " + reportPath);
+
+                List<CveResult> aboveThreshold = sorted.stream()
+                        .filter(v -> v.getCvssScore() >= effectiveThreshold)
+                        .collect(Collectors.toList());
+
+                if (aboveThreshold.isEmpty()) {
+                    if (sorted.isEmpty()) {
+                        getLog().info("Aucune vulnérabilité détectée par Xray.");
+                    } else {
+                        getLog().info("Aucune vulnérabilité ne dépasse le seuil configuré.");
+                    }
+                    logViolations(sorted);
+                    return;
+                }
+
+                getLog().error(String.format(Locale.ROOT,
+                        "%d vulnérabilité(s) dépassent le seuil CVSS %.1f :", aboveThreshold.size(), effectiveThreshold));
+                logViolations(aboveThreshold);
+
+                if (failOnThreshold) {
+                    throw new MojoFailureException("Scan Xray échoué : vulnérabilité(s) critique(s) détectée(s).");
+                } else {
+                    getLog().warn("Des vulnérabilités dépassent le seuil mais failOnThreshold=false");
+                }
+            } finally {
+                cleanupTemporaryArchive(archiveCandidate);
             }
         } catch (XrayClient.AuthenticationException e) {
             throw new MojoFailureException("Authentification Xray échouée : " + e.getMessage(), e);
@@ -142,44 +161,7 @@ public class XrayScanMojo extends AbstractMojo {
     }
 
     private Path getReportPath() {
-        String buildDirectory = project != null && project.getBuild() != null
-                ? project.getBuild().getDirectory()
-                : "target";
-        return Path.of(buildDirectory, "xray-scan-report.json");
-    }
-
-    private String resolveProjectComponentId() {
-        if (project == null) {
-            return null;
-        }
-        String groupId = normalizeCoordinate(project.getGroupId());
-        String artifactId = normalizeCoordinate(project.getArtifactId());
-        String version = normalizeCoordinate(project.getVersion());
-        if (groupId == null || artifactId == null || version == null) {
-            return null;
-        }
-        return "gav://" + groupId + ":" + artifactId + ":" + version;
-    }
-
-    private Set<String> resolveDependencyComponentIds() {
-        if (project == null) {
-            return Set.of();
-        }
-        Collection<Artifact> artifacts = project.getArtifacts();
-        if (artifacts == null || artifacts.isEmpty()) {
-            return Set.of();
-        }
-        Set<String> componentIds = new HashSet<>();
-        for (Artifact artifact : artifacts) {
-            if (!isCompileScope(artifact)) {
-                continue;
-            }
-            String componentId = toComponentId(artifact);
-            if (componentId != null) {
-                componentIds.add(componentId);
-            }
-        }
-        return componentIds;
+        return resolveBuildDirectoryPath().resolve("xray-scan-report.json");
     }
 
     private List<CveResult> filterViolationsByCompileScope(List<CveResult> violations) {
@@ -215,37 +197,6 @@ public class XrayScanMojo extends AbstractMojo {
             addArtifactNames(names, artifact);
         }
         return names;
-    }
-
-    private String toComponentId(Artifact artifact) {
-        if (artifact == null) {
-            return null;
-        }
-        String groupId = normalizeCoordinate(artifact.getGroupId());
-        String artifactId = normalizeCoordinate(artifact.getArtifactId());
-        String version = normalizeCoordinate(artifact.getVersion());
-        String classifier = normalizeCoordinate(artifact.getClassifier());
-        if (groupId == null || artifactId == null || version == null) {
-            return null;
-        }
-        StringBuilder builder = new StringBuilder("gav://")
-                .append(groupId)
-                .append(":")
-                .append(artifactId)
-                .append(":")
-                .append(version);
-        if (classifier != null && !classifier.isBlank()) {
-            builder.append(":").append(classifier);
-        }
-        return builder.toString();
-    }
-
-    private String normalizeCoordinate(String value) {
-        if (value == null) {
-            return null;
-        }
-        String trimmed = value.trim();
-        return trimmed.isEmpty() ? null : trimmed;
     }
 
     private void addArtifactNames(Set<String> names, Artifact artifact) {
@@ -350,5 +301,90 @@ public class XrayScanMojo extends AbstractMojo {
 
     private boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
+    }
+
+    private ArchiveCandidate locateArchiveCandidate() throws IOException {
+        if (project == null) {
+            return null;
+        }
+        Artifact mainArtifact = project.getArtifact();
+        if (mainArtifact != null) {
+            File file = mainArtifact.getFile();
+            if (file != null && file.isFile()) {
+                return new ArchiveCandidate(file.toPath(), false);
+            }
+        }
+        ArchiveCandidate packaged = packageTargetDirectory();
+        if (packaged != null) {
+            return packaged;
+        }
+        return null;
+    }
+
+    private ArchiveCandidate packageTargetDirectory() throws IOException {
+        Path buildDirectory = resolveBuildDirectoryPath();
+        if (!Files.exists(buildDirectory) || !Files.isDirectory(buildDirectory)) {
+            return null;
+        }
+        Path tempZip = Files.createTempFile("xray-scan-", ".zip");
+        try (ZipOutputStream outputStream = new ZipOutputStream(Files.newOutputStream(tempZip));
+             var paths = Files.walk(buildDirectory)) {
+            paths.filter(Files::isRegularFile)
+                    .forEach(path -> addFileToZip(outputStream, buildDirectory, path));
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
+        }
+        tempZip.toFile().deleteOnExit();
+        return new ArchiveCandidate(tempZip, true);
+    }
+
+    private void addFileToZip(ZipOutputStream outputStream, Path root, Path file) {
+        Path relative = root.relativize(file);
+        String entryName = relative.toString().replace('\\', '/');
+        if (entryName.isEmpty()) {
+            entryName = file.getFileName().toString();
+        }
+        ZipEntry entry = new ZipEntry(entryName);
+        try {
+            outputStream.putNextEntry(entry);
+            Files.copy(file, outputStream);
+            outputStream.closeEntry();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private void cleanupTemporaryArchive(ArchiveCandidate candidate) {
+        if (candidate == null || !candidate.temporary() || candidate.path() == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(candidate.path());
+        } catch (IOException e) {
+            if (getLog().isDebugEnabled()) {
+                getLog().debug("Impossible de supprimer l'archive temporaire " + candidate.path(), e);
+            }
+        }
+    }
+
+    private Path resolveBuildDirectoryPath() {
+        if (project != null && project.getBuild() != null) {
+            String directory = project.getBuild().getDirectory();
+            if (directory != null && !directory.isBlank()) {
+                return Path.of(directory);
+            }
+        }
+        return Path.of("target");
+    }
+
+    private String normalizeWatch(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
+    private record ArchiveCandidate(Path path, boolean temporary) {
     }
 }

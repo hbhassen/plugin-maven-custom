@@ -13,6 +13,10 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -23,6 +27,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.HexFormat;
 
 /**
  * Client HTTP léger pour consommer l'API JFrog Xray.
@@ -30,6 +35,7 @@ import java.util.Set;
 public class XrayClient {
 
     private static final String GRAPH_SCAN_PATH = "../v1/scan/graph";
+    private static final String SCAN_BINARY_PATH = "scanBinary";
     private static final String SCAN_TYPE_DEPENDENCY = "dependency";
     private static final Duration DEFAULT_POLL_INTERVAL = Duration.ofSeconds(3);
     private static final Duration DEFAULT_POLL_TIMEOUT = Duration.ofMinutes(15);
@@ -70,6 +76,47 @@ public class XrayClient {
                     .forEach(root::addNode);
         }
         return executeScan(root, SCAN_TYPE_DEPENDENCY);
+    }
+
+    public List<CveResult> scanArchive(Path archive, String watch)
+            throws IOException, AuthenticationException {
+        if (archive == null) {
+            return List.of();
+        }
+        if (!Files.exists(archive) || !Files.isRegularFile(archive)) {
+            throw new IOException("Archive à scanner introuvable : " + archive);
+        }
+
+        byte[] content = Files.readAllBytes(archive);
+        if (content.length == 0 && log != null) {
+            log.warn("Archive fournie à Xray vide : " + archive);
+        }
+
+        String encoded = Base64.getEncoder().encodeToString(content);
+        String sha256 = computeSha256(content);
+        long size = content.length;
+        String filename = archive.getFileName() != null ? archive.getFileName().toString() : "archive";
+
+        var body = mapper.createObjectNode();
+        body.put("data", encoded);
+        body.put("filename", filename);
+        body.put("sha256", sha256);
+        body.put("size", size);
+        if (watch != null && !watch.isBlank()) {
+            body.put("watch", watch);
+        }
+
+        URI scanUri = baseUri.resolve(SCAN_BINARY_PATH);
+        HttpRequest request = HttpRequest.newBuilder(scanUri)
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
+                .header("Authorization", authorizationHeader)
+                .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+                .build();
+
+        HttpResponse<String> response = send(request, Set.of(200, 202));
+        JsonNode root = parseJson(response.body());
+        return extractScanResults(root);
     }
 
     private List<CveResult> executeScan(GraphNode graph, String scanType)
@@ -158,7 +205,21 @@ public class XrayClient {
                 String componentId = entry.getKey();
                 PackageInfo info = parseComponentId(componentId);
                 JsonNode componentDetails = entry.getValue();
-                String fixedVersion = firstTextFromArray(componentDetails.path("fixed_versions"));
+                String fixedVersion = resolveFixedVersion(componentDetails);
+                CveResult result = new CveResult(
+                        cveId,
+                        info.packageName,
+                        info.version,
+                        cvssScore,
+                        severity != null ? severity : "",
+                        summary,
+                        fixedVersion);
+                target.add(result);
+            }
+        } else if (componentsNode != null && componentsNode.isArray() && componentsNode.size() > 0) {
+            for (JsonNode componentNode : componentsNode) {
+                PackageInfo info = parseComponentNode(componentNode);
+                String fixedVersion = resolveFixedVersion(componentNode);
                 CveResult result = new CveResult(
                         cveId,
                         info.packageName,
@@ -218,9 +279,23 @@ public class XrayClient {
                 if (score <= 0) {
                     score = parseScore(cve.path("cvss_v2_score"));
                 }
+                if (score <= 0) {
+                    score = parseScore(cve.path("cvss_v3"));
+                }
                 if (score > 0) {
                     return score;
                 }
+            }
+        }
+        JsonNode cvssNode = issueNode.path("cvss");
+        if (cvssNode != null && cvssNode.isObject()) {
+            double v3Score = parseScore(cvssNode.path("v3").path("score"));
+            if (v3Score > 0) {
+                return v3Score;
+            }
+            double v2Score = parseScore(cvssNode.path("v2").path("score"));
+            if (v2Score > 0) {
+                return v2Score;
             }
         }
         double issueScore = parseScore(issueNode.path("cvss_v3_score"));
@@ -231,6 +306,43 @@ public class XrayClient {
             return issueScore;
         }
         return mapSeverityToScore(severity);
+    }
+
+    private String resolveFixedVersion(JsonNode componentDetails) {
+        String fixedVersion = firstTextFromArray(componentDetails.path("fixed_versions"));
+        if (fixedVersion == null || fixedVersion.isBlank()) {
+            fixedVersion = firstTextFromArray(componentDetails.path("fixedVersions"));
+        }
+        return fixedVersion != null ? fixedVersion : "";
+    }
+
+    private PackageInfo parseComponentNode(JsonNode componentNode) {
+        if (componentNode == null || componentNode.isMissingNode()) {
+            return new PackageInfo("", "");
+        }
+        String componentId = componentNode.path("component_id").asText(null);
+        if (componentId == null || componentId.isBlank()) {
+            componentId = componentNode.path("componentId").asText(null);
+        }
+        if (componentId != null && !componentId.isBlank()) {
+            return parseComponentId(componentId);
+        }
+        String packageName = componentNode.path("package_name").asText(null);
+        if (packageName == null || packageName.isBlank()) {
+            packageName = componentNode.path("name").asText(null);
+        }
+        String version = componentNode.path("version").asText(null);
+        return new PackageInfo(packageName != null ? packageName : "", version != null ? version : "");
+    }
+
+    private String computeSha256(byte[] content) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(content);
+            return HexFormat.of().formatHex(hash);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IOException("Algorithme SHA-256 indisponible", e);
+        }
     }
 
     private double parseScore(JsonNode node) {

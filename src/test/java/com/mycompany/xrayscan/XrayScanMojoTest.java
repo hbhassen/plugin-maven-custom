@@ -1,8 +1,9 @@
 package com.mycompany.xrayscan;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
+import com.github.tomakehurst.wiremock.stubbing.ServeEvent;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.artifact.DefaultArtifact;
 import org.apache.maven.artifact.handler.DefaultArtifactHandler;
@@ -14,17 +15,24 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.LinkedHashSet;
-import java.util.Set;
+import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
-import static com.github.tomakehurst.wiremock.client.WireMock.get;
-import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.matchingJsonPath;
+import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.stubFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.verify;
@@ -50,21 +58,25 @@ class XrayScanMojoTest {
     }
 
     @Test
-    void shouldGenerateReportWithoutFailureWhenNoCveAboveThreshold() throws Exception {
-        stubFor(get(urlPathEqualTo("/api/v2/violations"))
-                .withQueryParam("watch", equalTo("default"))
+    void shouldUploadMainArtifactAndGenerateReport() throws Exception {
+        byte[] jarContent = "fake-jar".getBytes(StandardCharsets.UTF_8);
+        Path artifactFile = buildDirectory.resolve("demo-app-1.0.0.jar");
+        Files.write(artifactFile, jarContent);
+
+        stubFor(post(urlPathEqualTo("/api/v2/scanBinary"))
                 .willReturn(aResponse()
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"violations\":[{" +
-                                "\"cve\":\"CVE-2024-0001\"," +
-                                "\"components\":[{\"name\":\"log4j-core\",\"version\":\"2.19.0\",\"fixed_versions\":[\"2.19.1\"]}]," +
-                                "\"cvss_score\":6.5," +
+                                "\"issue_id\":\"XRAY-0001\"," +
+                                "\"summary\":\"Test vulnerability\"," +
                                 "\"severity\":\"Medium\"," +
-                                "\"summary\":\"Test vulnerability\"}]}")));
+                                "\"cves\":[{\"cve\":\"CVE-2024-0001\",\"cvss_v3_score\":6.5}]," +
+                                "\"components\":[{\"package_name\":\"log4j-core\",\"version\":\"2.19.0\",\"fixed_versions\":[\"2.19.1\"]}]}]}")));
 
-        XrayScanMojo mojo = newMojo("default", true,
-                artifact("org.apache.logging.log4j", "log4j-core", "2.19.0", Artifact.SCOPE_COMPILE));
+        Artifact mainArtifact = artifact("com.example", "demo-app", "1.0.0", Artifact.SCOPE_COMPILE, artifactFile);
+        Artifact dependency = artifact("org.apache.logging.log4j", "log4j-core", "2.19.0", Artifact.SCOPE_COMPILE, null);
+        XrayScanMojo mojo = newMojo(mainArtifact, "default-watch", true, dependency);
 
         mojo.execute();
 
@@ -72,182 +84,103 @@ class XrayScanMojoTest {
         assertThat(Files.exists(report)).isTrue();
         JsonNode results = MAPPER.readTree(report.toFile());
         assertThat(results.isArray()).isTrue();
-        assertThat(results.size()).isEqualTo(1);
+        assertThat(results).hasSize(1);
         assertThat(results.get(0).path("cvssScore").asDouble()).isEqualTo(6.5);
-        assertThat(results.get(0).path("fixedVersion").asText()).isEqualTo("2.19.1");
+
+        String expectedBase64 = Base64.getEncoder().encodeToString(jarContent);
+        verify(postRequestedFor(urlPathEqualTo("/api/v2/scanBinary"))
+                .withRequestBody(matchingJsonPath("$.watch", equalTo("default-watch")))
+                .withRequestBody(matchingJsonPath("$.filename", equalTo("demo-app-1.0.0.jar")))
+                .withRequestBody(matchingJsonPath("$.data", equalTo(expectedBase64))));
     }
 
     @Test
-    void shouldFailBuildWhenVulnerabilityAboveThreshold() throws Exception {
-        stubFor(get(urlPathEqualTo("/api/v2/violations"))
-                .withQueryParam("watch", equalTo("critical-watch"))
+    void shouldFailBuildWhenViolationAboveThreshold() throws Exception {
+        byte[] jarContent = "artifact".getBytes(StandardCharsets.UTF_8);
+        Path artifactFile = buildDirectory.resolve("commons-io-2.6.jar");
+        Files.write(artifactFile, jarContent);
+
+        stubFor(post(urlPathEqualTo("/api/v2/scanBinary"))
                 .willReturn(aResponse()
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"violations\":[{" +
-                                "\"cve\":\"CVE-2024-9999\"," +
-                                "\"components\":[{\"name\":\"commons-io\",\"version\":\"2.6\",\"fixed_versions\":[\"2.7\"]}]," +
-                                "\"cvss_score\":9.1," +
+                                "\"issue_id\":\"XRAY-9999\"," +
+                                "\"summary\":\"Critical vulnerability\"," +
                                 "\"severity\":\"Critical\"," +
-                                "\"summary\":\"Critical vulnerability\"}]}")));
-        stubFor(get(urlPathEqualTo("/api/v2/watches/critical-watch"))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/json")
-                        .withBody("{\"threshold\":8.5}")));
+                                "\"cves\":[{\"cve\":\"CVE-2024-9999\",\"cvss_v3_score\":9.1}]," +
+                                "\"components\":[{\"package_name\":\"commons-io\",\"version\":\"2.6\",\"fixed_versions\":[\"2.7\"]}]}]}")));
 
-        XrayScanMojo mojo = newMojo("critical-watch", true,
-                artifact("commons-io", "commons-io", "2.6", Artifact.SCOPE_COMPILE));
+        Artifact mainArtifact = artifact("commons-io", "commons-io", "2.6", Artifact.SCOPE_COMPILE, artifactFile);
+        Artifact dependency = artifact("commons-io", "commons-io", "2.6", Artifact.SCOPE_COMPILE, null);
+        XrayScanMojo mojo = newMojo(mainArtifact, "critical-watch", true, dependency);
 
         assertThatThrownBy(mojo::execute)
                 .isInstanceOf(MojoFailureException.class)
                 .hasMessageContaining("vulnérabilité(s) critique(s)");
+
+        verify(postRequestedFor(urlPathEqualTo("/api/v2/scanBinary"))
+                .withRequestBody(matchingJsonPath("$.watch", equalTo("critical-watch"))));
     }
 
     @Test
-    void shouldIncludeAllViolationsInGeneratedReport() throws Exception {
-        stubFor(get(urlPathEqualTo("/api/v2/violations"))
-                .withQueryParam("watch", equalTo("custom-watch"))
+    void shouldZipTargetDirectoryWhenArtifactMissing() throws Exception {
+        stubFor(post(urlPathEqualTo("/api/v2/scanBinary"))
                 .willReturn(aResponse()
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
-                        .withBody("{\"violations\":[{" +
-                                "\"cve\":\"CVE-2024-1234\"," +
-                                "\"components\":[{\"name\":\"commons-io\",\"version\":\"2.6\",\"fixed_versions\":[\"2.7\"]}]," +
-                                "\"cvss_score\":9.1," +
-                                "\"severity\":\"Critical\"," +
-                                "\"summary\":\"Critical vulnerability\"},{" +
-                                "\"cve\":\"CVE-2024-5678\"," +
-                                "\"components\":[{\"name\":\"guava\",\"version\":\"32.0\",\"fixed_versions\":[\"32.1\"]}]," +
-                                "\"cvss_score\":4.3," +
-                                "\"severity\":\"Medium\"," +
-                                "\"summary\":\"Moderate vulnerability\"}]}")));
-        stubFor(get(urlPathEqualTo("/api/v2/watches/custom-watch"))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/json")
-                        .withBody("{\"threshold\":8.5}")));
+                        .withBody("{\"violations\":[]}")));
 
-        XrayScanMojo mojo = newMojo("custom-watch", true,
-                artifact("commons-io", "commons-io", "2.6", Artifact.SCOPE_COMPILE),
-                artifact("com.google.guava", "guava", "32.0", Artifact.SCOPE_COMPILE));
+        Path classesDir = buildDirectory.resolve("classes");
+        Files.createDirectories(classesDir);
+        Files.write(classesDir.resolve("App.class"), new byte[]{0x01, 0x02, 0x03});
 
-        assertThatThrownBy(mojo::execute)
-                .isInstanceOf(MojoFailureException.class);
+        Artifact mainArtifact = artifact("com.example", "demo-app", "1.0.0", Artifact.SCOPE_COMPILE, null);
+        XrayScanMojo mojo = newMojo(mainArtifact, "archive-watch", true);
 
-        Path report = buildDirectory.resolve("xray-scan-report.json");
-        assertThat(Files.exists(report)).isTrue();
-        JsonNode results = MAPPER.readTree(report.toFile());
-        assertThat(results.isArray()).isTrue();
-        assertThat(results.size()).isEqualTo(2);
+        mojo.execute();
 
-        JsonNode first = results.get(0);
-        JsonNode second = results.get(1);
+        List<ServeEvent> events = wireMock.getAllServeEvents();
+        assertThat(events).hasSize(1);
+        JsonNode requestJson = MAPPER.readTree(events.get(0).getRequest().getBodyAsString());
+        String filename = requestJson.path("filename").asText();
+        assertThat(filename).endsWith(".zip");
 
-        assertThat(first.path("cveId").asText()).isEqualTo("CVE-2024-1234");
-        assertThat(first.path("fixedVersion").asText()).isEqualTo("2.7");
+        String base64Data = requestJson.path("data").asText();
+        byte[] decoded = Base64.getDecoder().decode(base64Data);
+        List<String> entries = new ArrayList<>();
+        try (ZipInputStream zipInputStream = new ZipInputStream(new ByteArrayInputStream(decoded))) {
+            ZipEntry entry;
+            while ((entry = zipInputStream.getNextEntry()) != null) {
+                entries.add(entry.getName());
+            }
+        }
 
-        assertThat(second.path("cveId").asText()).isEqualTo("CVE-2024-5678");
-        assertThat(second.path("fixedVersion").asText()).isEqualTo("32.1");
+        assertThat(entries).contains("classes/App.class");
     }
 
     @Test
     void shouldRaiseFailureWhenAuthenticationFails() throws Exception {
-        stubFor(get(urlPathEqualTo("/api/v2/violations"))
-                .withQueryParam("watch", equalTo("default"))
+        stubFor(post(urlPathEqualTo("/api/v2/scanBinary"))
                 .willReturn(aResponse().withStatus(401)));
 
-        XrayScanMojo mojo = newMojo("default", true,
-                artifact("org.apache.logging.log4j", "log4j-core", "2.19.0", Artifact.SCOPE_COMPILE));
+        Path artifactFile = buildDirectory.resolve("demo-app-1.0.0.jar");
+        Files.write(artifactFile, "binary".getBytes(StandardCharsets.UTF_8));
+
+        Artifact mainArtifact = artifact("com.example", "demo-app", "1.0.0", Artifact.SCOPE_COMPILE, artifactFile);
+        XrayScanMojo mojo = newMojo(mainArtifact, "default-watch", true);
 
         assertThatThrownBy(mojo::execute)
                 .isInstanceOf(MojoFailureException.class)
                 .hasMessageContaining("Authentification Xray");
     }
 
-    @Test
-    void shouldIgnoreViolationsOutsideCompileScope() throws Exception {
-        stubFor(get(urlPathEqualTo("/api/v2/violations"))
-                .withQueryParam("watch", equalTo("default"))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/json")
-                        .withBody("{\"violations\":[{" +
-                                "\"cve\":\"CVE-2024-7777\"," +
-                                "\"components\":[{\"name\":\"junit-jupiter\",\"version\":\"5.10.2\"}]," +
-                                "\"cvss_score\":9.3," +
-                                "\"severity\":\"Critical\"," +
-                                "\"summary\":\"Test scope vulnerability\"}]}")));
-
-        XrayScanMojo mojo = newMojo("default", true,
-                artifact("org.junit.jupiter", "junit-jupiter", "5.10.2", Artifact.SCOPE_TEST));
-
-        mojo.execute();
-
-        Path report = buildDirectory.resolve("xray-scan-report.json");
-        assertThat(Files.exists(report)).isTrue();
-        JsonNode results = MAPPER.readTree(report.toFile());
-        assertThat(results.isArray()).isTrue();
-        assertThat(results).isEmpty();
-    }
-
-    @Test
-    void shouldConsiderDependenciesWithoutExplicitScope() throws Exception {
-        stubFor(get(urlPathEqualTo("/api/v2/violations"))
-                .withQueryParam("watch", equalTo("default"))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/json")
-                        .withBody("{\"violations\":[{" +
-                                "\"cve\":\"CVE-2024-8888\"," +
-                                "\"components\":[{\"name\":\"custom-lib\",\"version\":\"1.0.0\"}]," +
-                                "\"cvss_score\":9.0," +
-                                "\"severity\":\"Critical\"," +
-                                "\"summary\":\"Default scope vulnerability\"}]}")));
-
-        XrayScanMojo mojo = newMojo("default", true,
-                artifact("com.mycompany", "custom-lib", "1.0.0", null));
-
-        assertThatThrownBy(mojo::execute)
-                .isInstanceOf(MojoFailureException.class)
-                .hasMessageContaining("vulnérabilité(s) critique(s)");
-    }
-
-    @Test
-    void shouldEncodeCustomWatchNamesForThresholdLookup() throws Exception {
-        stubFor(get(urlPathEqualTo("/api/v2/violations"))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/json")
-                        .withBody("{\"violations\":[]}")));
-        stubFor(get(urlPathEqualTo("/api/v2/watches/custom%20watch"))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/json")
-                        .withBody("{\"threshold\":7.0}")));
-
-        XrayScanMojo mojo = newMojo("custom watch", true,
-                artifact("org.apache.logging.log4j", "log4j-core", "2.19.0", Artifact.SCOPE_COMPILE));
-
-        mojo.execute();
-
-        Path report = buildDirectory.resolve("xray-scan-report.json");
-        assertThat(Files.exists(report)).isTrue();
-        JsonNode results = MAPPER.readTree(report.toFile());
-        assertThat(results.isArray()).isTrue();
-        assertThat(results).isEmpty();
-
-        verify(getRequestedFor(urlPathEqualTo("/api/v2/violations"))
-                .withQueryParam("watch", equalTo("custom watch")));
-        verify(getRequestedFor(urlPathEqualTo("/api/v2/watches/custom%20watch")));
-    }
-
-    private XrayScanMojo newMojo(String watch, boolean failOnThreshold, Artifact... artifacts) throws Exception {
+    private XrayScanMojo newMojo(Artifact mainArtifact, String watchName, boolean failOnThreshold, Artifact... dependencies) throws Exception {
         XrayScanMojo mojo = new XrayScanMojo();
         setField(mojo, "xrayUrl", wireMock.baseUrl() + "/api/v2");
         setField(mojo, "username", "user");
         setField(mojo, "password", "pass");
-        setField(mojo, "watch", watch);
+        setField(mojo, "watch", watchName);
         setField(mojo, "failOnThreshold", failOnThreshold);
         setField(mojo, "timeoutSeconds", 30);
         setField(mojo, "skip", false);
@@ -256,18 +189,27 @@ class XrayScanMojoTest {
         Build build = new Build();
         build.setDirectory(buildDirectory.toString());
         project.setBuild(build);
-        Set<Artifact> artifactSet = new LinkedHashSet<>(Arrays.asList(artifacts));
+        project.setArtifact(mainArtifact);
+
+        LinkedHashSet<Artifact> artifactSet = new LinkedHashSet<>();
+        if (dependencies != null && dependencies.length > 0) {
+            artifactSet.addAll(Arrays.asList(dependencies));
+        }
+        if (mainArtifact != null) {
+            artifactSet.add(mainArtifact);
+        }
         project.setArtifacts(artifactSet);
         project.setDependencyArtifacts(artifactSet);
+
         setField(mojo, "project", project);
         return mojo;
     }
 
-    private Artifact artifact(String groupId, String artifactId, String version, String scope) {
+    private Artifact artifact(String groupId, String artifactId, String version, String scope, Path file) {
         DefaultArtifactHandler handler = new DefaultArtifactHandler("jar");
         DefaultArtifact artifact = new DefaultArtifact(groupId, artifactId,
                 VersionRange.createFromVersion(version), scope, "jar", null, handler);
-        artifact.setFile(null);
+        artifact.setFile(file != null ? file.toFile() : null);
         return artifact;
     }
 

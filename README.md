@@ -1,14 +1,16 @@
 # xray-scan-maven-plugin
 
-Plugin Maven permettant d'automatiser le scan de vulnérabilités d'un projet Java via l'API "On-Demand Binary Scan" de JFrog Xray (`api/v1/scan/graph`). Il se base sur la spécification fournie et fournit un objectif `scan` rattaché par défaut à la phase `verify`.
+Plugin Maven permettant d'automatiser le scan de vulnérabilités d'un projet Java via l'API "On-Demand Binary Scan" de JFrog Xray (`api/v2/scanBinary`). Il se base sur la spécification fournie et fournit un objectif `scan` rattaché par défaut à la phase `verify`.
 
 ## 1. Fonctionnalités principales
 
-- Connexion à JFrog Xray (authentification Basic) et déclenchement d'un scan à la demande sur le graphe de dépendances (`api/v1/scan/graph`).
+- Connexion à JFrog Xray (authentification Basic) et déclenchement d'un scan binaire à la demande (`api/v2/scanBinary`).
+- Envoi automatique de l'artefact principal généré par Maven (JAR, WAR, …) ou, à défaut, empaquetage du contenu du répertoire `target/` dans une archive temporaire.
+- Possibilité de cibler un watch/contrôle Xray spécifique via la propriété `watch` (filtrage et politique de sécurité côté Xray).
 - Seuil CVSS configurable (`threshold`, défaut 7.0) appliqué localement lors de l'analyse des résultats.
 - Génération d'un rapport JSON complet dans `target/xray-scan-report.json`.
 - Affichage dans la console Maven des CVE détectées triées par score décroissant.
-- Échec du build (`MojoFailureException`) si au moins une vulnérabilité dépasse le seuil et que `failOnThreshold=true`.
+- Échec du build (`MojoFailureException`) si au moins une vulnérabilité dépasse le seuil et que `failOnThreshold=true`, garantissant un blocage avant la publication (`deploy`).
 - Possibilité de continuer le build en mode dégradé (`failOnThreshold=false`).
 
 ## 2. Prérequis
@@ -62,12 +64,13 @@ mvn clean install
 
 | Propriété         | Type    | Défaut  | Description |
 |-------------------|---------|---------|-------------|
-| `xrayUrl`         | String  | –       | URL de base de l'API JFrog Xray (terminée par `/api/v2`, le plugin utilise automatiquement `api/v1/scan/graph`). |
+| `xrayUrl`         | String  | –       | URL de base de l'API JFrog Xray (terminée par `/api/v2`, le plugin appelle `POST /api/v2/scanBinary`). |
 | `username`        | String  | –       | Identifiant ou access token (le mot de passe ne sera pas loggé). |
 | `password`        | String  | –       | Mot de passe ou token API. Peut provenir d'une variable d'environnement ou du `settings.xml`. |
 | `failOnThreshold` | Boolean | `true`  | Si `true`, le build échoue lorsqu'une violation dépasse le seuil. |
 | `timeoutSeconds`  | Integer | `300`   | Timeout maximal pour chaque appel HTTP. |
 | `threshold`       | Double  | `7.0`   | Seuil CVSS appliqué localement (>= déclenche l'échec si `failOnThreshold=true`). |
+| `watch`           | String  | –       | Nom du watch ou contrôle Xray à appliquer lors du scan binaire. |
 | `skip`            | Boolean | `false` | Permet d'ignorer totalement le scan. |
 
 ### 4.3 Exécution via la ligne de commande
@@ -77,6 +80,7 @@ mvn com.mycompany:xray-scan-maven-plugin:1.0.0:scan \
   -DxrayUrl=https://xray.mycompany.com/api/v2 \
   -Dusername=john.doe \
   -Dpassword=${XRAY_TOKEN} \
+  -Dwatch=release-blocker \
   -Dthreshold=8.0 \
   -DfailOnThreshold=true
 ```
@@ -86,6 +90,7 @@ mvn com.mycompany:xray-scan-maven-plugin:1.0.0:scan \
 - Les vulnérabilités sont listées dans les logs Maven sous la forme :
   `CVE-ID | package | version | CVSS | severity | fixed-version`.
 - Le rapport JSON (`target/xray-scan-report.json`) contient l'intégralité des violations (y compris celles sous le seuil) :
+- Le watch renseigné (propriété `watch`) est transmis à l'API `scanBinary`, ce qui permet d'appliquer les règles Xray (blocker, ignore, etc.) avant de publier l'artefact.
 
 ```json
 [
